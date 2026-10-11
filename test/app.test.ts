@@ -162,6 +162,62 @@ test('images: real type sniffed, oversized ones shrunk to <=2000px JPEG, junk dr
   assert.equal(await prepImage({ content: Buffer.from('not an image'), contentType: 'image/heic', size: 12 }), null);
 });
 
+test('replies: headers connect organizers, corrections preserve UID and series, older backfills cannot revert them', async () => {
+  const make = async (id: string, day: number, body: string, references = '', from = 'organizer@mit.edu') => parseRaw(
+    `Message-ID: <${id}@mit.edu>\r\nFrom: ${from}\r\nTo: free-foods@mit.edu\r\nSubject: Re: Series dinner\r\nDate: ${day} Oct 2026 12:00:00 -0400\r\n${references ? `References: <series-original@mit.edu>\r\nIn-Reply-To: <${references}@mit.edu>\r\n` : ''}\r\n${body}`);
+  const a = event({ title: 'Series dinner', start: '2027-01-02T18:00:00-05:00', location: 'W20-901' });
+  const b = event({ ...a, start: '2027-01-03T18:00:00-05:00' });
+  const fake = (events: Extraction['events']) => ({ extract: async (): Promise<Extraction> => ({ is_free_food: true, reason: 'test', events }) });
+  await processEmail(await make('series-original', 4, 'Free dinner Jan 2 and 3'), fake([a, b]));
+  const range = () => listEvents('2027-01-01', '2027-01-05');
+  const original = range();
+  const firstId = original[0].id, secondId = original[1].id;
+  const reply = await make('series-update', 7, 'First dinner moved to 7pm in W20-902.', 'series-original', 'cohost@mit.edu');
+  assert.deepEqual(reply.references, ['<series-original@mit.edu>']);
+  await processEmail(reply, { extract: async mail => {
+    assert.equal(mail.previousEvents?.length, 2);
+    assert.match(promptText(mail), /Previous events[\s\S]*W20-901/);
+    return { is_free_food: true, reason: 'correction', events: [{ ...a, existing_event_id: firstId, start: '2027-01-02T19:00:00-05:00', location: 'W20-902' }] };
+  } });
+  assert.equal(range().length, 2);
+  assert.equal(range()[0].id, firstId);
+  assert.equal(range()[0].location, 'W20-902');
+  assert.equal(range()[1].id, secondId);
+  // An older unseen reminder is processed after the update, not allowed to overwrite it.
+  await processEmail(await make('series-old-reminder', 5, 'Dinner at six', 'series-original'), fake([{ ...a, existing_event_id: firstId }]));
+  assert.equal(range()[0].start_at, '2027-01-03T00:00:00.000Z');
+  assert.equal(range()[0].location, 'W20-902');
+  assert.deepEqual(await processEmail(reply, { extract: async () => { throw new Error('duplicate reached model'); } }), { skipped: 'seen' });
+  // Another mailing-list copy with a different subject/thread merges, keeping both thread links.
+  const copy = { ...await make('series-copy', 8, 'dinner'), subject: 'Dinner announcement copy' };
+  await processEmail(copy, fake([{ ...a, start: '2027-01-02T19:00:00-05:00', location: 'W20-902' }]));
+  assert.equal(range().length, 2);
+  await processEmail(await make('series-cancel', 9, 'First dinner cancelled', 'series-update'), { extract: async mail => {
+    assert.ok(mail.previousEvents?.some(e => e.id === firstId));
+    return { is_free_food: true, reason: 'cancelled', events: [{ ...a, existing_event_id: firstId, start: '2027-01-02T19:00:00-05:00', location: 'W20-902', cancelled: true }] };
+  } });
+  assert.equal(range()[0].cancelled, 1);
+  assert.equal(range()[1].cancelled, 0);
+  const exportedReply = { ...await make('series-no-headers', 10, 'Second dinner moved to W20-903', '', 'third-organizer@mit.edu') };
+  await processEmail(exportedReply, { extract: async mail => {
+    assert.ok(mail.previousEvents?.some(e => e.id === secondId));
+    return { is_free_food: true, reason: 'exported correction', events: [{ ...b, existing_event_id: secondId, location: 'W20-903' }] };
+  } });
+  assert.equal(range()[1].id, secondId);
+  assert.equal(range()[1].location, 'W20-903');
+});
+
+test('failed event writes roll back message receipt so delivery can retry', async () => {
+  const { db, seenMessage } = await import('../db.ts');
+  const m = await parseRaw(dormspam('Atomic dinner', 'pizza', '<atomic@mit.edu>'));
+  db.exec(`create trigger fail_test before insert on events when new.message_id='<atomic@mit.edu>' begin select raise(abort, 'test write failure'); end`);
+  const fake = { extract: async (): Promise<Extraction> => ({ is_free_food: true, reason: 'test', events: [event({ title: 'Atomic dinner', location: 'atomic-test-room' })] }) };
+  await assert.rejects(processEmail(m, fake), /test write failure/);
+  assert.equal(seenMessage(m.id), false);
+  db.exec('drop trigger fail_test');
+  assert.equal((await processEmail(m, fake) as { events: number }).events, 1);
+});
+
 test('toICS: valid skeleton, UTC stamps, escaped commas', () => {
   const ics = toICS([{ id: 7, title: 'Pizza, boba', start_at: '2026-10-09T22:00:00.000Z', end_at: null, location: 'W20-306', updated_at: '2026-10-08 18:00:00',
     sender: 'a@mit.edu', cancelled: 0, food: null, host: null, notes: null, leftovers: 0, confidence: 1, subject: 's', source: 'dormspam' }], 'example.test');

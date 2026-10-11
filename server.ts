@@ -161,8 +161,12 @@ export async function handle(req: IncomingMessage, res: ServerResponse): Promise
     // Spend caps: one mail sender cannot flood the model (token-only callers are trusted), and the inbox has a daily ceiling. 429 makes the worker bounce the mail.
     if (envFrom !== undefined && !allow(`ingest:${String(envFrom).toLowerCase()}`, Number(process.env.MAX_INGEST_PER_SENDER_HOUR || 30), 36e5)) return reply(429, 'sender rate limit');
     if (!allow('ingest:all', Number(process.env.MAX_INGEST_PER_DAY || 1500), 864e5)) return reply(429, 'daily ingest limit');
-    const mails = (await parseAll(await body(req))).slice(0, 200);
-    if (mails.length === 1 && url.searchParams.get('async') !== '1') return reply(200, JSON.stringify(await processEmail(mails[0])), 'application/json');
+    const mails = (await parseAll(await body(req))).slice(0, 200).sort((a, b) => +a.date - +b.date);
+    if (mails.length === 1 && url.searchParams.get('async') !== '1') {
+      const result = await processEmail(mails[0]);
+      console.log('[ingest]', JSON.stringify(result)); // delivery outcome, without email contents
+      return reply(200, JSON.stringify(result), 'application/json');
+    }
     // Backfill (many attached .eml files, or ?async=1): answer now so nothing bounces or times out; process in order.
     reply(200, JSON.stringify({ queued: mails.length }), 'application/json');
     for (const m of mails) processEmail(m).then(r => console.log('[backfill]', m.subject, JSON.stringify(r)), e => console.error('[backfill]', m.subject, (e as Error).message));

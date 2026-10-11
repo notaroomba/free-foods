@@ -1,7 +1,7 @@
 import { simpleParser, type ParsedMail, type Attachment } from 'mailparser';
 import { ImapFlow } from 'imapflow';
 import sharp from 'sharp';
-import { seenMessage, saveMessage, upsertEvent, replaceThread, kvGet, kvSet } from './db.ts';
+import { seenMessage, saveMessage, saveExtraction, messageContext, threadEvents, recentThreads, kvGet, kvSet } from './db.ts';
 import { prefilter, extract, type Mail, type Extraction, type ImageType } from './extract.ts';
 
 const MAX_IMAGE = 20e6, MAX_PDF = 20e6, BUDGET = 22e6; // attachments up to 20 MB are accepted; images are shrunk below, PDFs go as-is (API: 32 MB/request)
@@ -58,6 +58,7 @@ async function toMail(m: ParsedMail): Promise<Mail> {
     id: m.messageId || `no-id-${Date.now()}-${Math.random()}`,
     from: m.from?.text ?? '',
     subject: m.subject ?? '',
+    references: [...new Set([...(Array.isArray(m.references) ? m.references : m.references ? [m.references] : []), ...(m.inReplyTo ? [m.inReplyTo] : [])])],
     date: m.date ?? new Date(),
     text, recipients, images,
     pdfs: m.attachments.filter(a => a.contentType === 'application/pdf' && a.size <= MAX_PDF).slice(0, 2).filter(fits)
@@ -98,11 +99,31 @@ export const dedupKey = (ev: { start: string; location?: string | null; title: s
 // ponytail: whole-thread replace; a bump that mentions only tonight drops the series' other dates. Per-day replace if that bites.
 const NOISE = '(?:re|fw|fwd|bump|last bump|final bump|reminder|update|updated|correction|tmrw|tomorrow|tday|today|tonight|now)';
 const LEAD = new RegExp(`^(\\s*\\[?${NOISE}\\]?\\b[:!.\\s-]*)+`, 'i'), TAIL = new RegExp(`([:!.\\s-]*\\b${NOISE}\\b[!.\\s]*)+$`, 'i');
+const normalizedSubject = (subject: string) => subject.toLowerCase().replace(LEAD, '').replace(TAIL, '').replace(/[^a-z0-9]+/g, ' ').trim();
 export const threadKey = (mail: Pick<Mail, 'subject' | 'from'>) => {
-  const subj = (mail.subject || '').toLowerCase().replace(LEAD, '').replace(TAIL, '').replace(/[^a-z0-9]+/g, ' ').trim();
+  const subj = normalizedSubject(mail.subject || '');
   const addr = (mail.from.match(/<([^>]+)>/)?.[1] || mail.from).toLowerCase();
   return `${addr}|${subj}`;
 };
+
+function resolveThread(mail: Mail): string {
+  for (const id of [...(mail.references ?? [])].reverse()) {
+    const prior = messageContext(id);
+    if (prior) return prior.thread_key || threadKey({ from: prior.sender || '', subject: prior.subject || '' });
+  }
+  // References also connect replies received before their parent (e.g. a newest-first backfill).
+  const root = mail.references?.[0];
+  if (root && threadEvents(`message:${root}`).length) return `message:${root}`;
+  const fallback = threadKey(mail);
+  if (threadEvents(fallback).length) return fallback;
+  if (threadEvents(`message:${mail.id}`).length) return `message:${mail.id}`;
+  // Some Outlook exports omit reply headers. Use an exact normalized subject only when it identifies one recent thread.
+  if (/^\s*(?:re|fw|fwd)\s*:/i.test(mail.subject)) {
+    const candidates = new Set(recentThreads(mail.date).filter(t => normalizedSubject(t.subject) === normalizedSubject(mail.subject)).map(t => t.thread_key));
+    if (candidates.size === 1) return [...candidates][0];
+  }
+  return root ? `message:${root}` : fallback;
+}
 
 export interface Deps { extract: (mail: Mail) => Promise<Extraction> }
 export type ProcessResult =
@@ -129,24 +150,30 @@ async function processOne(mail: Mail, deps: Deps = { extract }): Promise<Process
   // Matched keywords are only recorded for words.ts.
   const matched = src === 'list' ? ['free-food-list'] : prefilter(`${mail.subject}\n${mail.text}`);
   const base = { id: mail.id, receivedAt, sender: mail.from, subject: mail.subject, snippet: mail.text.slice(0, 300),
-    matched: matched.join(','), isFreeFood: null, result: null };
-  const out = await deps.extract(mail);
-  saveMessage({ ...base, isFreeFood: out.is_free_food ? 1 : 0, result: JSON.stringify(out) });
+    matched: matched.join(','), isFreeFood: null, result: null, threadKey: resolveThread(mail) };
+  const previous = threadEvents(base.threadKey);
+  const out = await deps.extract({ ...mail, previousEvents: previous.map(e => ({ id: e.id, title: e.title, food: e.food,
+    start: e.start_at, end: e.end_at, location: e.location, host: e.host, notes: e.notes,
+    leftovers_now: !!e.leftovers, cancelled: !!e.cancelled, confidence: e.confidence ?? 0, quantity: 'unknown' })) });
   let events = (out.events || []).filter(ev => ev.start && !Number.isNaN(Date.parse(ev.start))).slice(0, 10); // one email cannot flood the calendar
   // free-foods list posts are spontaneous ("leftovers in 10-250, come now"): only worth a calendar entry when the event is still
   // ahead or there is a lot of food. Dormspam is never filtered this way.
-  if (src === 'list') events = events.filter(ev => Date.parse(ev.start) > Date.now() || ev.quantity === 'large');
-  const tk = threadKey(mail);
-  if (events.length) replaceThread(tk, mail.id);
-  for (const ev of events) {
-    upsertEvent({
-      dedupKey: dedupKey(ev), messageId: mail.id, threadKey: tk, source: src, title: ev.title, food: ev.food || null,
+  if (src === 'list') events = events.filter(ev => Date.parse(ev.start) > Date.now() || ev.quantity === 'large' || previous.some(p => p.id === ev.existing_event_id));
+  const changes = events.map(ev => {
+    // IDs supplied by the model are accepted only from this thread. A one-event reminder also has an unambiguous match
+    // on its original date (including older extractors which did not return an ID).
+    const existing = previous.find(p => p.id === ev.existing_event_id)
+      ?? previous.find(p => p.dedup_key === dedupKey(ev))
+      ?? (previous.length === 1 && events.length === 1 && previous[0].start_at.slice(0, 10) === new Date(ev.start).toISOString().slice(0, 10) ? previous[0] : undefined);
+    return { existingId: existing?.id, event: {
+      dedupKey: dedupKey(ev), messageId: mail.id, threadKey: base.threadKey, source: existing?.source || src, title: ev.title, food: ev.food || null,
       startAt: new Date(ev.start).toISOString(), endAt: ev.end && !Number.isNaN(Date.parse(ev.end)) ? new Date(ev.end).toISOString() : null,
       location: ev.location || null, host: ev.host || null, notes: ev.notes || null,
       leftovers: ev.leftovers_now, confidence: ev.confidence, cancelled: ev.cancelled,
       sender: out.poster || mail.from, subject: mail.subject, // a forwarded email is credited to the original poster
-    });
-  }
+    } };
+  });
+  saveExtraction({ ...base, isFreeFood: out.is_free_food ? 1 : 0, result: JSON.stringify(out) }, changes);
   return { source: src, isFreeFood: out.is_free_food, events: events.length };
 }
 
