@@ -58,6 +58,10 @@ try { db.exec('alter table messages add column thread_key text'); } catch { /* c
 db.exec(`create index if not exists messages_thread on messages(thread_key);
   create index if not exists events_thread on events(thread_key);
   create table if not exists event_threads (thread_key text, event_id integer, primary key(thread_key, event_id));
+  create trigger if not exists clean_event_threads after delete on events begin
+    delete from event_threads where event_id=old.id;
+  end;
+  delete from event_threads where event_id not in (select id from events);
   insert or ignore into event_threads select thread_key, id from events where thread_key is not null;`);
 // events created before the source column existed: the message log knows which came from the free-foods list
 db.exec(`update events set source = case when (select matched from messages where messages.id = events.message_id) = 'free-food-list' then 'list' else 'dormspam' end where source is null`);
@@ -117,7 +121,6 @@ export function saveExtraction(message: MessageRecord, events: { event: EventInp
         if (duplicate) {
           db.prepare('insert or ignore into event_threads select thread_key, ? from event_threads where event_id=?').run(current.id, duplicate.id);
           q.deleteEvent.run(duplicate.id);
-          db.prepare('delete from event_threads where event_id=?').run(duplicate.id);
         }
         // Keep the calendar ID/UID even when its room or time changes.
         db.prepare(`update events set dedup_key=?, message_id=?, title=?, food=?, start_at=?, end_at=?, location=?, host=?, notes=?,

@@ -274,5 +274,7 @@ test('http: healthz open, ingest needs token, events served as JSON', async () =
     assert.equal((await fetch(`${base}/api/events/${id}`, { method: 'DELETE' })).status, 401);
     assert.deepEqual(await (await fetch(`${base}/api/events/${id}`, { method: 'DELETE', headers: { authorization: 'Bearer test-token' } })).json(), { deleted: 1 });
     assert.equal(((await (await fetch(`${base}/api/events?start=2026-10-09T00:00:00Z&end=2026-10-10T00:00:00Z`)).json()) as { title: string }[]).filter(e => e.title === 'Free pizza — Hack Night').length, 0);
+    const { threadEvents } = await import('../db.ts');
+    assert.equal(threadEvents('jdoe@mit.edu|hack night').length, 0); // deleted calendar IDs cannot retain reply links
   } finally { srv.close(); }
 });
