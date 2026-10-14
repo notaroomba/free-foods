@@ -82,13 +82,14 @@ const onList = (mail: Pick<Mail, 'recipients'>, lists: string[]) =>
   lists.some(l => mail.recipients.includes(`${l}@mit.edu`) || mail.recipients.includes(`${l}.mit.edu`));
 
 export type Source = 'list' | 'dormspam' | 'other';
-/** Label only; every email is analysed. 'list' = free-food list, 'dormspam' = sent to a dorm list or carrying the footer,
- *  'other' = anything else that was forwarded. null only when the sender opted out with dormsoup-ignore / freefood-ignore. */
+/** 'list' = free-food list, 'dormspam' = sent to a dorm list or carrying the footer, 'other' = anything else.
+ *  null = do not read it: the sender opted out (dormsoup-ignore / freefood-ignore), or it is personal mail and ANALYZE_ALL is off.
+ *  Keep ANALYZE_ALL off when the whole mailbox is forwarded (mailto.mit.edu split); it is safe to turn on when a rule only forwards dormspam. */
 export function source(mail: Pick<Mail, 'text' | 'recipients'>): Source | null {
   if (/dormsoup-ignore|freefood-ignore/i.test(mail.text)) return null;
   if (onList(mail, FOOD_LISTS) || QUOTED_FOOD.test(mail.text)) return 'list';
   if (onList(mail, DORM_LISTS) || QUOTED_DORM.test(mail.text) || DORMSPAM_RE.test(mail.text)) return 'dormspam';
-  return 'other';
+  return process.env.ANALYZE_ALL === '1' ? 'other' : null;
 }
 
 const norm = (s: string | null | undefined) => (s || '').toLowerCase().replace(/\b(room|rm|building|bldg)\b\.?/g, '').replace(/[^a-z0-9]+/g, '');
@@ -127,7 +128,7 @@ function resolveThread(mail: Mail): string {
 
 export interface Deps { extract: (mail: Mail) => Promise<Extraction> }
 export type ProcessResult =
-  | { skipped: 'seen' | 'opted-out' }
+  | { skipped: 'seen' | 'not-read' }
   | { source: Source; isFreeFood: boolean; events: number };
 
 /** Run one parsed email through gate -> prefilter -> LLM -> DB. `deps.extract` is injectable for tests. */
@@ -142,9 +143,9 @@ async function processOne(mail: Mail, deps: Deps = { extract }): Promise<Process
   if (seenMessage(mail.id)) return { skipped: 'seen' };
   const receivedAt = new Date(mail.date).toISOString();
   const src = source(mail);
-  if (!src) { // sender opted out: remember only the id so we never look at it again
-    saveMessage({ id: mail.id, receivedAt, sender: null, subject: null, snippet: '', matched: 'opted-out', isFreeFood: null, result: null });
-    return { skipped: 'opted-out' };
+  if (!src) { // opted out, or personal mail with ANALYZE_ALL off: remember only the id, never store or read the content
+    saveMessage({ id: mail.id, receivedAt, sender: null, subject: null, snippet: '', matched: 'not-read', isFreeFood: null, result: null });
+    return { skipped: 'not-read' };
   }
   // No gate: every email that reaches the app goes to the model (~$0.0005 each on Haiku), text plus every readable attachment.
   // Matched keywords are only recorded for words.ts.

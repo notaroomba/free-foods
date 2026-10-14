@@ -6,7 +6,7 @@ import { db } from './db.ts';
 import { KEYWORDS } from './extract.ts';
 
 interface Row { subject: string | null; snippet: string | null; matched: string | null; is_free_food: number | null }
-const rows = db.prepare("select subject, snippet, matched, is_free_food from messages where matched != 'opted-out'").all() as unknown as Row[];
+const rows = db.prepare("select subject, snippet, matched, is_free_food from messages where matched != 'not-read'").all() as unknown as Row[];
 const labelled = rows.filter(r => r.is_free_food !== null);
 if (labelled.length < 10) { console.log(`only ${labelled.length} labelled messages; need ~10+`); process.exit(0); }
 

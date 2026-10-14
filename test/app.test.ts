@@ -49,8 +49,11 @@ test('source label: every real-world dormspam footer variant, list recipients, o
   assert.equal(source({ ...base, text: '> From: x\r\n> To: ec-discuss\r\n> hi' }), 'dormspam'); // reply-quoted forward, CRLF
   assert.equal(source({ ...base, text: 'To: Ian MacGregor <imac@mit.edu>\nhi' }), 'other'); // a surname, not the macgregor list
   assert.equal(source({ ...base, text: "bcc'd to dorms. dormsoup-ignore" }), null);
+  assert.equal(source({ text: 'Hi Nathan, your pset grade is posted', recipients: 'nathan@mit.edu' }), null); // personal mail is never read by default
+  process.env.ANALYZE_ALL = '1';
   assert.equal(source({ text: 'Hi Nathan, your pset grade is posted', recipients: 'nathan@mit.edu' }), 'other');
   assert.equal(source({ text: 'I live in MacGregor and ec-discuss is noisy', recipients: 'nathan@mit.edu' }), 'other'); // list names in prose are not dormspam
+  delete process.env.ANALYZE_ALL;
 });
 
 test('schema: every object closes additionalProperties and requires all fields', () => {
@@ -111,10 +114,12 @@ test('processEmail: every email reaches the model (only opt-outs skip), dedupe +
       : { is_free_food: false, reason: 'no food', events: [] }),
   };
   const optOut = `Message-ID: <opt@mit.edu>\r\nFrom: Prof <prof@mit.edu>\r\nTo: nathan@mit.edu\r\nDate: Thu, 08 Oct 2026 14:00:00 -0400\r\nSubject: lunch tomorrow?\r\n\r\nWant to grab lunch? dormsoup-ignore\r\n`;
-  assert.deepEqual(await processEmail(await parseRaw(Buffer.from(optOut)), fake), { skipped: 'opted-out' });
+  assert.deepEqual(await processEmail(await parseRaw(Buffer.from(optOut)), fake), { skipped: 'not-read' });
   assert.equal(calls, 0);
+  process.env.ANALYZE_ALL = '1';
   const personal = `Message-ID: <priv@mit.edu>\r\nFrom: Prof <prof@mit.edu>\r\nTo: nathan@mit.edu\r\nDate: Thu, 08 Oct 2026 14:00:00 -0400\r\nSubject: pset\r\n\r\nGrades are posted.\r\n`;
-  assert.deepEqual(await processEmail(await parseRaw(Buffer.from(personal)), fake), { source: 'other', isFreeFood: false, events: 0 }); // no gate: analysed anyway
+  assert.deepEqual(await processEmail(await parseRaw(Buffer.from(personal)), fake), { source: 'other', isFreeFood: false, events: 0 }); // ANALYZE_ALL: analysed
+  delete process.env.ANALYZE_ALL;
   assert.deepEqual(await processEmail(await parseRaw(Buffer.from(dormspam('UROP', 'apply now', '<u@mit.edu>'))), fake), { source: 'dormspam', isFreeFood: false, events: 0 });
   assert.equal(calls, 2); // no food keyword, still analysed
   const r1 = await processEmail(await parseRaw(Buffer.from(dormspam('Hack Night', 'free pizza in 32-G449 at 6pm', '<p1@mit.edu>'))), fake);
@@ -244,7 +249,7 @@ test('http: healthz open, ingest needs token, events served as JSON', async () =
     assert.equal(pre.headers.get('access-control-allow-origin'), 'https://outlook.office.com'); // browser-side backfill from Outlook on the web
     const optOut = `Message-ID: <h@mit.edu>\r\nFrom: Housing <housing@mit.edu>\r\nTo: nathan@mit.edu\r\nSubject: Housing lottery\r\n\r\nlottery results posted. dormsoup-ignore\r\n`;
     const r = await fetch(`${base}/ingest`, { method: 'POST', headers: { authorization: 'Bearer test-token' }, body: optOut });
-    assert.deepEqual(await r.json(), { skipped: 'opted-out' });
+    assert.deepEqual(await r.json(), { skipped: 'not-read' });
     // envelope sender outside mit.edu (set by the Cloudflare worker) is ignored before parsing
     const r2 = await fetch(`${base}/ingest`, { method: 'POST', headers: { authorization: 'Bearer test-token', 'x-envelope-from': 'spammer@example.com' }, body: dormspam('Free pizza', "free pizza now in 10-250\nbcc'd to dorms", '<spam@example.com>') });
     assert.equal(r2.status, 202);
