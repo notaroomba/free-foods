@@ -47,7 +47,7 @@ test('source label: every real-world dormspam footer variant, list recipients, o
   assert.equal(source({ ...base, text: 'From: Marvin Mao\nSent: Thursday\nTo: ec-discuss\nSubject: Rice in talbot\n\nHi gang i have placed a tray of rice' }), 'dormspam');
   assert.equal(source({ ...base, text: 'From: x\nTo: free-foods@mit.edu\nSubject: pizza in 10-250' }), 'list');
   assert.equal(source({ ...base, text: '> From: x\r\n> To: ec-discuss\r\n> hi' }), 'dormspam'); // reply-quoted forward, CRLF
-  assert.equal(source({ ...base, text: 'To: Ian MacGregor <imac@mit.edu>\nhi' }), 'other'); // a surname, not the macgregor list
+  assert.equal(source({ ...base, text: 'To: Ian MacGregor <imac@mit.edu>\nhi' }), null); // a surname, not the macgregor list (and not read by default)
   assert.equal(source({ ...base, text: "bcc'd to dorms. dormsoup-ignore" }), null);
   assert.equal(source({ text: 'Hi Nathan, your pset grade is posted', recipients: 'nathan@mit.edu' }), null); // personal mail is never read by default
   process.env.ANALYZE_ALL = '1';
