@@ -10,6 +10,12 @@ interface Ev {
 interface Me { email: string; name?: string; auth: boolean; ics: string; webcal: string; gcal: string }
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
+// food filters: match on what the model wrote in title / food / notes
+const FILTERS: Record<string, RegExp | null> = { all: null, pizza: /pizza|pizzas|slice/i, boba: /boba|bubble tea|milk tea|gong cha|kung fu tea|tiger sugar/i };
+let filter = 'all';
+try { if (localStorage.getItem('ff-food') && FILTERS[localStorage.getItem('ff-food')!] !== undefined) filter = localStorage.getItem('ff-food')!; } catch {}
+const passes = (e: { title: string; food: string | null; notes: string | null }) => !FILTERS[filter] || FILTERS[filter]!.test(`${e.title} ${e.food || ''} ${e.notes || ''}`);
+const syncFilterButtons = () => all('[data-filter]').forEach(b => b.classList.toggle('active', b.dataset.filter === filter));
 const all = <T extends HTMLElement = HTMLElement>(sel: string, root: ParentNode = document) => [...root.querySelectorAll<T>(sel)];
 const esc = (s: unknown) => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c] as string));
 const fmt = (d: string, o: Intl.DateTimeFormatOptions) => new Date(d).toLocaleString([], o);
@@ -118,9 +124,10 @@ document.addEventListener('click', (e) => {
   if (!t.closest('.menu')) closeMenus();
 });
 document.addEventListener('click', (e) => {
-  const t = (e.target as HTMLElement).closest<HTMLElement>('[data-app-open],[data-win-close],[data-action],[data-view]');
+  const t = (e.target as HTMLElement).closest<HTMLElement>('[data-app-open],[data-win-close],[data-action],[data-view],[data-filter]');
   if (!t) return;
   closeMenus(); toggleStart(false);
+  if (t.dataset.filter) { filter = t.dataset.filter; try { localStorage.setItem('ff-food', filter); } catch {} syncFilterButtons(); cal.refetchEvents(); loadNow(); }
   if (t.dataset.appOpen) openApp(t.dataset.appOpen);
   if (t.dataset.winClose) closeApp(t.dataset.winClose);
   if (t.dataset.view) cal.changeView(t.dataset.view);
@@ -159,7 +166,7 @@ function initCalendar() {
     eventDisplay: 'block', // solid colour blocks (default month view draws timed events as a dot + text)
     events: (info: { startStr: string; endStr: string }, ok: (evs: unknown[]) => void, fail: (e: unknown) => void) =>
       fetch(`/api/events?start=${encodeURIComponent(info.startStr)}&end=${encodeURIComponent(info.endStr)}`).then(r => r.json())
-        .then((rows: Ev[]) => ok(rows)).catch(fail),
+        .then((rows: Ev[]) => ok(rows.filter(passes))).catch(fail),
     eventDataTransform: (r: Ev) => ({ id: r.id, title: r.title, start: r.start_at, end: r.end_at || undefined,
       backgroundColor: color(r), borderColor: color(r), classNames: classes(r), extendedProps: r }), // list view's dot takes borderColor
     eventClick: (i: { jsEvent: Event; event: { extendedProps: Ev } }) => { i.jsEvent.preventDefault(); show(i.event.extendedProps); },
@@ -179,7 +186,7 @@ async function loadNow() {
   const rows = (await (await fetch(`/api/events?start=${new Date(t - 3 * 36e5).toISOString()}&end=${new Date(t + 36e5).toISOString()}`)).json()) as Ev[];
   if (!Array.isArray(rows)) return; // a 502 during a deploy hands back an error object
   const endMs = (e: Ev) => e.end_at ? Date.parse(e.end_at) : Date.parse(e.start_at) + 72e5;
-  const live = rows.filter(e => !e.cancelled && (e.leftovers || Date.parse(e.start_at) <= t + 36e5) && endMs(e) > t);
+  const live = rows.filter(e => passes(e) && !e.cancelled && (e.leftovers || Date.parse(e.start_at) <= t + 36e5) && endMs(e) > t);
   const ul = $('nowList');
   ul.innerHTML = live.length
     ? live.map((e, i) => `<li data-i="${i}"><img src="/icons/pizza.svg" alt=""><b>${esc(e.title)}</b><span>${esc(e.location || '')} · ${e.leftovers ? 'now' : fmt(e.start_at, { hour: 'numeric', minute: '2-digit' })}</span></li>`).join('')
@@ -195,6 +202,7 @@ tick(); setInterval(tick, 15000);
 
 openApp('calendar');
 initCalendar();
+syncFilterButtons();
 loadNow(); setInterval(loadNow, 5 * 60e3);
 
 fetch('/api/me').then(r => r.json() as Promise<Me>).then(me => {
